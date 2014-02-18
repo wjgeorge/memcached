@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -w
 #
 # memcached-tool:
 #   stats/management tool for memcached.
@@ -13,9 +13,16 @@
 #   public domain.  I give up all rights to this
 #   tool.  modify and copy at will.
 #
-
 use strict;
+use warnings;
+
 use IO::Socket::INET;
+use Getopt::Long;
+
+GetOptions("silent" => \my $silent,
+            "values" => \my $values,
+            "times" => \my $show_times,
+);
 
 my $addr = shift;
 my $mode = shift || "display";
@@ -45,18 +52,22 @@ undef $mode if @ARGV;
 
 die
     "Usage: memcached-tool <host[:port] | /path/to/socket> [mode]\n
-       memcached-tool 10.0.0.5:11211 display    # shows slabs
-       memcached-tool 10.0.0.5:11211            # same.  (default is display)
-       memcached-tool 10.0.0.5:11211 stats      # shows general stats
-       memcached-tool 10.0.0.5:11211 settings   # shows settings stats
-       memcached-tool 10.0.0.5:11211 sizes      # shows sizes stats
-       memcached-tool 10.0.0.5:11211 dump       # dumps keys and values
+       memcached-tool 10.0.0.5:11211 display               # shows slabs
+       memcached-tool 10.0.0.5:11211                       # same.  (default is display)
+       memcached-tool 10.0.0.5:11211 stats                 # shows general stats
+       memcached-tool 10.0.0.5:11211 settings              # shows settings stats
+       memcached-tool 10.0.0.5:11211 sizes                 # shows sizes stats
+       memcached-tool [-s -v -t] 10.0.0.5:11211 dump       # dumps keys and values
 
 WARNING! sizes is a development command.
 As of 1.4 it is still the only command which will lock your memcached instance for some time.
 If you have many millions of stored items, it can become unresponsive for several minutes.
 Run this at your own risk. It is roadmapped to either make this feature optional
 or at least speed it up.
+
+-s = silent (no diagnostics to STDERR)
+-v = no data values
+-t convert times (-1 is infinite)
 " unless $addr && $mode;
 
 
@@ -77,6 +88,23 @@ else {
 die "Couldn't connect to $addr\n" unless $sock;
 
 if ($mode eq 'dump') {
+
+    # need to get the fence value for indefinite cache
+   my %memvalues;
+   my $fence;
+   print $sock "stats\r\n";
+    while (<$sock>) {
+        last if /^END/;
+        chomp;
+        if (/^STAT\s+(\S*)\s+(.*)/) {
+            $memvalues{$1} = $2;
+        }
+    }
+   if ($memvalues{time} && $memvalues{uptime}) {
+	$fence = $memvalues{time} - $memvalues{uptime};
+   }
+
+
     my %items;
     my $totalitems;
 
@@ -89,12 +117,14 @@ if ($mode eq 'dump') {
             $totalitems += $2;
         }
     }
-    print STDERR "Dumping memcache contents\n";
-    print STDERR "  Number of buckets: " . scalar(keys(%items)) . "\n";
-    print STDERR "  Number of items  : $totalitems\n";
+    unless ($silent) {
+        print STDERR "Dumping memcache contents\n";
+        print STDERR "  Number of buckets: " . scalar(keys(%items)) . "\n";
+        print STDERR "  Number of items  : $totalitems\n";
+    }
 
     foreach my $bucket (sort(keys(%items))) {
-        print STDERR "Dumping bucket $bucket - " . $items{$bucket} . " total items\n";
+        print STDERR "Dumping bucket $bucket - " . $items{$bucket} . " total items\n" unless $silent;
         print $sock "stats cachedump $bucket $items{$bucket}\r\n";
         my %keyexp;
         while (<$sock>) {
@@ -114,7 +144,18 @@ if ($mode eq 'dump') {
                 my $len = $3;
                 my $val;
                 read $sock, $val, $len;
-                print "add $k $flags $keyexp{$k} $len\r\n$val\r\n";
+                print "add $k $flags ";
+                if ($show_times) {
+			if ($fence eq $keyexp{$k}) {
+                            print "noexpire ";
+			} else {
+			    print localtime($keyexp{$k})." ";
+                        }
+		} else {
+                    print $keyexp{$k}." ";
+                }
+		print $len."\r\n";
+                print $val."\r\n" unless $values;
                 # get the END
                 $_ = <$sock>;
                 $_ = <$sock>;
@@ -210,7 +251,7 @@ while (<$sock>) {
 print "  #  Item_Size  Max_age   Pages   Count   Full?  Evicted Evict_Time OOM\n";
 foreach my $n (1..$max) {
     my $it = $items{$n};
-    next if (0 == $it->{total_pages});
+	next unless $it->{total_pages};
     my $size = $it->{chunk_size} < 1024 ?
         "$it->{chunk_size}B" :
         sprintf("%.1fK", $it->{chunk_size} / 1024.0);
